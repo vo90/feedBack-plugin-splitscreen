@@ -586,7 +586,8 @@ try {
     ];
 
     // Per-panel viz controls surfaced in a panel's "3D ⚙" popover. Each entry:
-    //   { key, label, type:'toggle'|'range'|'select', default, min?, max?, step?, options? }
+    //   { key, label, type:'toggle'|'range'|'select', default, min?, max?, step?, options?,
+    //     commitOn?:'change', disabledWhen?:{key,equals}, disabledReason? }
     // `key` identifies the setting in the viz plugin's scoped settings bridge.
     // Legacy highway_3d uses h3d_bg_panel<N>_<key> localStorage entries, falling
     // back to h3d_bg_<key>. A viz plugin can override this list at runtime by
@@ -597,9 +598,9 @@ try {
     const VIZ_PANEL_CONTROLS = {
         highway_3d: [
             { key: 'palette',         label: 'Palette',                  type: 'select', default: 'default', options: H3D_PALETTES },
-            { key: 'cameraSmoothing', label: 'Camera smoothing (X-pan)', type: 'range',  default: 0.5, min: 0, max: 1, step: 0.05 },
+            { key: 'cameraSmoothing', label: 'Camera smoothing (X-pan)', type: 'range',  default: 0.5, min: 0, max: 1, step: 0.05, commitOn: 'change' },
             { key: 'cameraLockLow',   label: 'Lock camera at frets 1–12',type: 'toggle', default: false },
-            { key: 'cameraLockZoom',  label: 'Locked zoom (In ↔ Out)',   type: 'range',  default: 0.5, min: 0, max: 1, step: 0.05 },
+            { key: 'cameraLockZoom',  label: 'Locked zoom (In ↔ Out)',   type: 'range',  default: 0.5, min: 0, max: 1, step: 0.05, commitOn: 'change' },
         ],
     };
     // Range-control bounds with defaults (min/max/step are optional in the descriptor).
@@ -1445,10 +1446,51 @@ try {
     function buildVizPopover(panel, pluginId) {
         const pop = panel.vizPopover;
         if (!pop) return;
+        const session = panel._vizPopoverSession = {};
         pop.innerHTML = '';
         const controls = getPanelControlsFor(pluginId);
         const idx = panels.indexOf(panel);
         if (!controls || idx === -1) return;
+        const factory = vizFactory(pluginId), highway = panel.hw;
+        const entries = [];
+        // A replaced renderer/popover or a removed/reordered pane must not
+        // receive a late blur/change from controls belonging to the old view.
+        const isCurrent = () => panel._vizPopoverSession === session && panel.vizPopover === pop
+            && panels.indexOf(panel) === idx && panel.vizMode === pluginId && panel.hw === highway
+            && vizFactory(pluginId) === factory && getPanelControlsFor(pluginId) === controls;
+        const refreshAvailability = () => {
+            const current = isCurrent();
+            for (const entry of entries) {
+                const rule = entry.ctl.disabledWhen;
+                const dependency = rule && controls.find(ctl => ctl.key === rule.key);
+                const disabledByRule = current && dependency
+                    && _vizPanelGet(pluginId, idx, dependency) === rule.equals;
+                entry.input.disabled = !current || !!disabledByRule;
+                const reason = disabledByRule ? entry.ctl.disabledReason || 'Unavailable for the current setting.' : '';
+                entry.row.title = reason || (entry.ctl.commitOn === 'change' ? 'Release, press Enter or leave the field to apply.' : '');
+                entry.input.setAttribute('aria-label', entry.ctl.label + (reason ? '. ' + reason : ''));
+                entry.row.style.opacity = entry.input.disabled ? '0.55' : '';
+                if (entry.input.disabled && entry.dirty) {
+                    entry.sync(current ? _vizPanelGet(pluginId, idx, entry.ctl) : entry.saved);
+                }
+            }
+        };
+        const write = (entry, value) => {
+            refreshAvailability();
+            if (entry.input.disabled) {
+                entry.sync(isCurrent() ? _vizPanelGet(pluginId, idx, entry.ctl) : entry.saved);
+                return;
+            }
+            const previous = _vizPanelGet(pluginId, idx, entry.ctl);
+            const accepted = previous === value || _vizPanelSet(pluginId, idx, entry.ctl, value);
+            const actual = _vizPanelGet(pluginId, idx, entry.ctl);
+            entry.sync(actual === undefined ? previous : actual);
+            refreshAvailability();
+            if (!accepted) entry.row.title = 'Could not apply this setting. The previous value is unchanged.';
+        };
+        // External edits are picked up when the user returns to the popover;
+        // also check before every write. No settings polling or frame work.
+        pop.onpointerover = pop.onfocusin = refreshAvailability;
         const title = document.createElement('div');
         title.textContent = (vizPlugins.find(p => p.id === pluginId)?.name || pluginId) + ' — this panel';
         title.style.cssText = 'font-size:10px;color:#6b7280;margin-bottom:6px;white-space:nowrap;';
@@ -1460,11 +1502,14 @@ try {
             name.textContent = ctl.label;
             name.style.cssText = 'flex:1;';
             const cur = _vizPanelGet(pluginId, idx, ctl);
+            const entry = { ctl, row, input: null, dirty: false, saved: cur, sync: null };
             if (ctl.type === 'toggle') {
                 const cb = document.createElement('input');
                 cb.type = 'checkbox';
-                cb.checked = !!cur;
-                cb.onchange = () => _vizPanelSet(pluginId, panels.indexOf(panel), ctl, cb.checked);
+                entry.input = cb;
+                entry.sync = value => { entry.saved = value; entry.dirty = false; cb.checked = !!value; };
+                entry.sync(cur);
+                cb.onchange = () => write(entry, cb.checked);
                 row.appendChild(name);
                 row.appendChild(cb);
             } else if (ctl.type === 'range') {
@@ -1476,12 +1521,33 @@ try {
                 sl.style.cssText = 'width:90px;accent-color:#4080e0;';
                 const val = document.createElement('span');
                 val.style.cssText = 'width:30px;text-align:right;color:#9ca3af;font-size:10px;';
-                val.textContent = Number(cur).toFixed(2);
+                entry.input = sl;
+                entry.sync = value => {
+                    entry.saved = value; entry.dirty = false;
+                    sl.value = String(value);
+                    val.textContent = Number(value).toFixed(2);
+                };
+                entry.sync(cur);
+                const commit = () => {
+                    const value = parseFloat(sl.value);
+                    if (Number.isFinite(value)) write(entry, Math.max(lo, Math.min(hi, value)));
+                    else entry.sync(_vizPanelGet(pluginId, idx, ctl));
+                };
                 sl.oninput = () => {
+                    refreshAvailability();
+                    if (sl.disabled) { entry.sync(isCurrent() ? _vizPanelGet(pluginId, idx, ctl) : entry.saved); return; }
                     const v = parseFloat(sl.value);
                     val.textContent = (Number.isFinite(v) ? v : Number(ctl.default ?? 0)).toFixed(2);
-                    _vizPanelSet(pluginId, panels.indexOf(panel), ctl, v);
+                    entry.dirty = true;
+                    if (ctl.commitOn !== 'change') commit();
                 };
+                if (ctl.commitOn === 'change') {
+                    sl.onchange = commit;
+                    sl.onblur = () => { if (entry.dirty) commit(); };
+                    sl.onkeydown = event => {
+                        if (event.key === 'Enter') { event.preventDefault(); commit(); }
+                    };
+                }
                 row.appendChild(name);
                 row.appendChild(sl);
                 row.appendChild(val);
@@ -1493,15 +1559,19 @@ try {
                     o.value = opt.id; o.textContent = opt.label;
                     sel.appendChild(o);
                 }
-                sel.value = String(cur);
-                sel.onchange = () => _vizPanelSet(pluginId, panels.indexOf(panel), ctl, sel.value);
+                entry.input = sel;
+                entry.sync = value => { entry.saved = value; entry.dirty = false; sel.value = String(value); };
+                entry.sync(cur);
+                sel.onchange = () => write(entry, sel.value);
                 row.appendChild(name);
                 row.appendChild(sel);
             } else {
                 continue;
             }
+            entries.push(entry);
             pop.appendChild(row);
         }
+        refreshAvailability();
     }
 
     function _showVizControls(panel, pluginId) {
@@ -1512,6 +1582,7 @@ try {
         panel.vizSettingsBtn.style.display = '';
     }
     function _hideVizControls(panel) {
+        panel._vizPopoverSession = null;
         if (panel.vizSettingsBtn) panel.vizSettingsBtn.style.display = 'none';
         if (panel.vizPopover) { panel.vizPopover.style.display = 'none'; panel.vizPopover.innerHTML = ''; }
     }
@@ -4810,10 +4881,11 @@ try {
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
             getWsUrl, resolveArrIndex, getDefaultArrangements,
-            panelToPrefs, migratePanelPrefs, _ctlRange, _vizPanelGet, _vizPanelSet,
+            panelToPrefs, migratePanelPrefs, _ctlRange, _vizPanelGet, _vizPanelSet, buildVizPopover,
             getSyncUrl, generateRoomKey, normalizeRoomKey, ensureRoomKey,
             buildShareUrl, makeRemoteFollowerCfg, ROOM_KEY_ALPHABET,
             _setArrangementsForTest(next) { arrangements = next; },
+            _setPanelsForTest(next) { panels = next; },
         };
     }
 })();
