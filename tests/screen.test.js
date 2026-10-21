@@ -92,6 +92,126 @@ test('_ctlRange fills defaults for missing/non-finite bounds', () => {
     assert.deepEqual(_ctlRange({ min: NaN, max: Infinity }), { lo: 0, hi: 1, st: 0.05 });
 });
 
+// Per-panel controls must use the renderer's effective value and scoped writer:
+// the inherited camera lead can differ from the descriptor's default.
+const cameraStartControl = {
+    key: 'stableCameraStartBeforeMs', type: 'range', default: 700, min: 25, max: 3000,
+};
+
+function installPanelFactory(properties, { legacy = false } = {}) {
+    const factory = Object.assign(function () {}, {
+        panelControls: [cameraStartControl], ...properties,
+    });
+    global.window[legacy ? 'slopsmithViz_highway_3d' : 'feedBackViz_highway_3d'] = factory;
+    return factory;
+}
+
+test('panel reads use the renderer bridge instead of stale storage/defaults', () => {
+    const { _vizPanelGet } = freshPlugin();
+    global.localStorage.setItem('h3d_bg_stableCameraStartBeforeMs', '900');
+    const calls = [];
+    installPanelFactory({ getPanelSetting: (index, key) => { calls.push([index, key]); return 400; } });
+    assert.equal(_vizPanelGet('highway_3d', 1, cameraStartControl), 400);
+    assert.deepEqual(calls, [[1, cameraStartControl.key]]);
+});
+
+test('panel writes preserve the value type and never invoke a global setter', () => {
+    const { _vizPanelSet } = freshPlugin();
+    const calls = [];
+    const controls = [cameraStartControl, { key: 'stableCameraFollow', type: 'toggle', default: true }];
+    installPanelFactory({ panelControls: controls, setPanelSetting: (...args) => { calls.push(args); return true; } });
+    let globalWrites = 0;
+    global.window.h3dBgSetStableCameraStartBeforeMs = () => { globalWrites++; };
+    global.window.h3dBgSetStableCameraFollow = () => { globalWrites++; };
+    assert.equal(_vizPanelSet('highway_3d', 0, controls[0], 600), true);
+    assert.equal(_vizPanelSet('highway_3d', 1, controls[1], false), true);
+    assert.deepEqual(calls, [[0, controls[0].key, 600], [1, controls[1].key, false]]);
+    assert.equal(global.localStorage.getItem('h3d_bg_panel0_' + controls[0].key), null);
+    assert.equal(global.localStorage.getItem('h3d_bg_panel1_' + controls[1].key), null);
+    assert.equal(globalWrites, 0);
+});
+
+test('the canonical factory bridge wins when both factory names exist', () => {
+    const { _vizPanelGet, _vizPanelSet } = freshPlugin();
+    installPanelFactory({ getPanelSetting: () => 400, setPanelSetting: () => true });
+    installPanelFactory({
+        getPanelSetting: () => assert.fail('legacy getter called'),
+        setPanelSetting: () => assert.fail('legacy setter called'),
+    }, { legacy: true });
+    assert.equal(_vizPanelGet('highway_3d', 0, cameraStartControl), 400);
+    assert.equal(_vizPanelSet('highway_3d', 0, cameraStartControl, 600), true);
+});
+
+test('a legacy-named factory can expose the scoped bridge', () => {
+    const { _vizPanelGet, _vizPanelSet } = freshPlugin();
+    const calls = [];
+    const toggle = { key: 'stableCameraFollow', type: 'toggle', default: true };
+    installPanelFactory({
+        panelControls: [toggle],
+        getPanelSetting: () => false,
+        setPanelSetting: (...args) => { calls.push(args); return true; },
+    }, { legacy: true });
+    assert.equal(_vizPanelGet('highway_3d', 2, toggle), false);
+    assert.equal(_vizPanelSet('highway_3d', 2, toggle, false), true);
+    assert.deepEqual(calls, [[2, toggle.key, false]]);
+});
+
+test('invalid panel indices and controls neither call the bridge nor write storage', () => {
+    const { _vizPanelGet, _vizPanelSet } = freshPlugin();
+    installPanelFactory({
+        getPanelSetting: () => assert.fail('invalid get forwarded'),
+        setPanelSetting: () => assert.fail('invalid set forwarded'),
+    });
+    global.localStorage.setItem = () => assert.fail('invalid storage write');
+    for (const index of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '0', null, undefined]) {
+        assert.equal(_vizPanelGet('highway_3d', index, cameraStartControl), undefined);
+        assert.equal(_vizPanelSet('highway_3d', index, cameraStartControl, 600), false);
+    }
+    assert.equal(_vizPanelGet('other', 0, cameraStartControl), undefined);
+    assert.equal(_vizPanelSet('other', 0, cameraStartControl, 600), false);
+    assert.equal(_vizPanelGet('highway_3d', 0, { key: 'unexposed' }), undefined);
+    assert.equal(_vizPanelSet('highway_3d', 0, { key: 'unexposed' }, 600), false);
+});
+
+test('bridge rejections and exceptions do not fall back to raw storage writes', () => {
+    const { _vizPanelGet, _vizPanelSet } = freshPlugin();
+    const factory = installPanelFactory({ getPanelSetting: () => undefined, setPanelSetting: () => false });
+    global.localStorage.setItem = () => assert.fail('rejected write fell through');
+    assert.equal(_vizPanelGet('highway_3d', 0, cameraStartControl), undefined);
+    assert.equal(_vizPanelSet('highway_3d', 0, cameraStartControl, 600), false);
+    factory.getPanelSetting = factory.setPanelSetting = () => { throw new Error('unavailable'); };
+    assert.equal(_vizPanelGet('highway_3d', 0, cameraStartControl), undefined);
+    assert.equal(_vizPanelSet('highway_3d', 0, cameraStartControl, 600), false);
+});
+
+test('legacy storage-only writes stay scoped and cannot reset another panel lead', () => {
+    const { _vizPanelGet, _vizPanelSet } = freshPlugin();
+    installPanelFactory({});
+    global.localStorage.setItem('h3d_bg_stableCameraPreparationMs', '400');
+    global.localStorage.setItem('h3d_bg_panel1_stableCameraStartBeforeMs', '450');
+    global.window.h3dBgSetStableCameraStartBeforeMs = value =>
+        global.localStorage.setItem('h3d_bg_stableCameraStartBeforeMs', value);
+    assert.equal(_vizPanelSet('highway_3d', 0, cameraStartControl, 600), true);
+    assert.equal(_vizPanelGet('highway_3d', 0, cameraStartControl), 600);
+    assert.equal(global.localStorage.getItem('h3d_bg_stableCameraStartBeforeMs'), null);
+    assert.equal(global.localStorage.getItem('h3d_bg_stableCameraPreparationMs'), '400');
+    assert.equal(global.localStorage.getItem('h3d_bg_panel1_stableCameraStartBeforeMs'), '450');
+});
+
+test('legacy fallback retains toggle/range coercion and reports blocked writes', () => {
+    const { _vizPanelGet, _vizPanelSet } = freshPlugin();
+    const toggle = { key: 'cameraLockLow', type: 'toggle', default: false };
+    const range = { key: 'cameraSmoothing', type: 'range', default: 0.5 };
+    global.localStorage.setItem('h3d_bg_cameraLockLow', 'false');
+    global.localStorage.setItem('h3d_bg_cameraSmoothing', '2');
+    assert.equal(_vizPanelGet('highway_3d', 0, toggle), false);
+    assert.equal(_vizPanelGet('highway_3d', 0, range), 1);
+    global.localStorage.setItem('h3d_bg_panel0_cameraSmoothing', 'invalid');
+    assert.equal(_vizPanelGet('highway_3d', 0, range), 0.5);
+    global.localStorage.setItem = () => { throw new Error('storage blocked'); };
+    assert.equal(_vizPanelSet('highway_3d', 0, range, 0.6), false);
+});
+
 test('panelToPrefs encodes a plain arrangement panel', () => {
     const mod = freshPlugin();
     mod._setArrangementsForTest([{ name: 'Lead' }]);

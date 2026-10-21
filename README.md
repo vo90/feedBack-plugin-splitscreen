@@ -159,6 +159,10 @@ window.slopsmithViz_my_viz = function () {
 
 Split screen automatically populates each panel's dropdown with this option and calls `panel.hw.setRenderer(factory())` when selected. **No changes to split screen's code are needed.** Each panel gets an independent renderer instance; the highway provides note data, timing, and the RAF loop.
 
+The 3D Highway settings popover uses `feedBackViz_highway_3d.getPanelSetting(panelIndex, key)` and `setPanelSetting(panelIndex, key, value)` when available (the legacy `slopsmithViz_highway_3d` factory name is also supported). The renderer owns setting inheritance, value coercion, storage fallbacks, and change notifications, so the popover displays the value that the panel actually uses. Writes retain number/boolean/string types and affect only that panel. The bridge accepts nonnegative safe integer panel indices and keys exposed in `panelControls`; invalid requests return `undefined` for reads or `false` for writes. An accepted write returns `true`.
+
+On older hosts without this bridge, the popover reads and writes the existing `h3d_bg_panel<N>_<key>` storage entries. Those writes take effect on the renderer's next settings reload. It never calls a global setter to refresh a panel, because doing so can change the inherited setting for other panels.
+
 See the [CLAUDE.md plugin guide](https://github.com/got-feedback/feedBack/blob/main/CLAUDE.md) for the full `setRenderer` lifecycle and bundle shape. The [3D Highway plugin](https://github.com/got-feedback/feedBack-plugin-3dhighway) is a reference implementation.
 
 ### Path 2: Pane plugins (own canvas + own WebSocket)
