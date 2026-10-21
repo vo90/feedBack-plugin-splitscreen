@@ -163,6 +163,10 @@ The 3D Highway settings popover uses `feedBackViz_highway_3d.getPanelSetting(pan
 
 On older hosts without this bridge, the popover reads and writes the existing `h3d_bg_panel<N>_<key>` storage entries. Those writes take effect on the renderer's next settings reload. It never calls a global setter to refresh a panel, because doing so can change the inherited setting for other panels.
 
+Range descriptors can opt into `commitOn: 'change'`: dragging updates the displayed value, then release, Enter or leaving the field applies it once. The 3D Highway marks its camera ranges this way, matching Camera tuning and avoiding repeated camera-plan rebuilds while dragging. Other ranges keep their existing live input behavior. A rejected write restores the effective value and can be retried.
+
+Descriptors can also specify `disabledWhen: { key: 'cameraMode', equals: 'stable' }` and a `disabledReason`. The X-pan smoothing control uses this because Stable follows its planned movement instead of that smoothing value. Its saved value remains available when another camera mode is selected. The reason appears in the label's tooltip and accessible name. Availability updates when the popover opens, a setting changes here, or the user returns to it; it is checked again before applying an edit. These updates keep the existing controls and focus, use no polling, and cannot write through a removed panel or replaced renderer.
+
 See the [CLAUDE.md plugin guide](https://github.com/got-feedback/feedBack/blob/main/CLAUDE.md) for the full `setRenderer` lifecycle and bundle shape. The [3D Highway plugin](https://github.com/got-feedback/feedBack-plugin-3dhighway) is a reference implementation.
 
 ### Path 2: Pane plugins (own canvas + own WebSocket)

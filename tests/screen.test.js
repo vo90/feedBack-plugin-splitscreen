@@ -15,6 +15,17 @@ function makeLocalStorage() {
     };
 }
 
+function makeElement(tag = 'div') {
+    return {
+        tagName: tag.toUpperCase(), children: [], attributes: {},
+        style: {}, classList: { add() {}, remove() {} },
+        addEventListener() {},
+        appendChild(child) { this.children.push(child); return child; },
+        setAttribute(key, value) { this.attributes[key] = String(value); },
+        set innerHTML(value) { this.children = []; },
+    };
+}
+
 function freshPlugin({ search = '', protocol = 'http:' } = {}) {
     const location = { search, host: 'localhost:8420', protocol };
     global.window = { location, addEventListener: () => {} };
@@ -22,10 +33,7 @@ function freshPlugin({ search = '', protocol = 'http:' } = {}) {
         getElementById: () => null,
         addEventListener: () => {},
         body: { appendChild: () => {} },
-        createElement: () => ({
-            style: {}, classList: { add() {}, remove() {} },
-            addEventListener() {}, appendChild() {}, setAttribute() {},
-        }),
+        createElement: makeElement,
         readyState: 'loading',
     };
     global.localStorage = makeLocalStorage();
@@ -210,6 +218,155 @@ test('legacy fallback retains toggle/range coercion and reports blocked writes',
     assert.equal(_vizPanelGet('highway_3d', 0, range), 0.5);
     global.localStorage.setItem = () => { throw new Error('storage blocked'); };
     assert.equal(_vizPanelSet('highway_3d', 0, range, 0.6), false);
+});
+
+const interactionControls = [
+    { key: 'cameraMode', label: 'Camera mode', type: 'select', default: 'stable',
+        options: [{ id: 'stable', label: 'Stable' }, { id: 'lookahead', label: 'Lookahead' }] },
+    { ...cameraStartControl, label: 'Start before', commitOn: 'change' },
+    { key: 'cameraSmoothing', label: 'X-pan smoothing', type: 'range', default: 0.5,
+        commitOn: 'change', disabledWhen: { key: 'cameraMode', equals: 'stable' },
+        disabledReason: 'Stable uses the lane plan instead of X-pan smoothing.' },
+    { key: 'intensity', label: 'Intensity', type: 'range', default: 0.5 },
+];
+
+function makePopover({ mode = 'stable', rejectWrites = false } = {}) {
+    const mod = freshPlugin();
+    const values = new Map(interactionControls.map(ctl => [ctl.key, ctl.default]));
+    values.set('cameraMode', mode);
+    const calls = [];
+    const factory = installPanelFactory({
+        panelControls: interactionControls,
+        getPanelSetting: (index, key) => values.get(key),
+        setPanelSetting: (index, key, value) => {
+            calls.push([index, key, value]);
+            if (rejectWrites) return false;
+            values.set(key, value); return true;
+        },
+    });
+    const panel = { vizMode: 'highway_3d', hw: {}, vizPopover: makeElement() };
+    const other = { vizMode: 'highway_3d', hw: {} };
+    mod._setPanelsForTest([other, panel]);
+    const rebuild = () => mod.buildVizPopover(panel, 'highway_3d');
+    rebuild();
+    const row = key => panel.vizPopover.children[interactionControls.findIndex(ctl => ctl.key === key) + 1];
+    const input = key => row(key).children[1];
+    return { mod, panel, other, factory, values, calls, rebuild, row, input };
+}
+
+test('camera drag previews hundreds of inputs and commits once to its own pane on release', () => {
+    const { calls, input, row, values } = makePopover();
+    const slider = input(cameraStartControl.key);
+    for (let value = 25; value <= 3000; value += 25) {
+        slider.value = String(value); slider.oninput();
+        assert.equal(row(cameraStartControl.key).children[2].textContent, value.toFixed(2));
+    }
+    assert.equal(calls.length, 0);
+    assert.equal(values.get(cameraStartControl.key), 700);
+    slider.onchange(); slider.onblur(); slider.onchange();
+    assert.deepEqual(calls, [[1, cameraStartControl.key, 3000]]);
+});
+
+test('camera keyboard changes, Enter and blur fallback commit without duplicate writes', () => {
+    const { calls, input } = makePopover();
+    const slider = input(cameraStartControl.key);
+    let prevented = 0;
+    slider.value = '725'; slider.oninput();
+    slider.onkeydown({ key: 'ArrowRight', preventDefault() { assert.fail('arrow prevented'); } });
+    assert.equal(calls.length, 0);
+    slider.onchange(); slider.onblur();
+    slider.value = '750'; slider.oninput();
+    slider.onkeydown({ key: 'Enter', preventDefault() { prevented++; } });
+    slider.onchange(); slider.onblur();
+    slider.value = '775'; slider.oninput(); slider.onblur(); slider.onchange();
+    assert.equal(prevented, 1);
+    assert.deepEqual(calls.map(call => call[2]), [725, 750, 775]);
+});
+
+test('unmarked non-camera ranges keep live input behavior', () => {
+    const { calls, input } = makePopover();
+    const slider = input('intensity');
+    for (const value of [0.6, 0.7, 0.8]) { slider.value = String(value); slider.oninput(); }
+    assert.deepEqual(calls, [[1, 'intensity', 0.6], [1, 'intensity', 0.7], [1, 'intensity', 0.8]]);
+});
+
+test('Stable disables smoothing with an accessible reason and keeps its saved value', () => {
+    const { calls, input, row, values } = makePopover();
+    const smoothing = input('cameraSmoothing'), mode = input('cameraMode');
+    assert.equal(smoothing.disabled, true);
+    assert.match(row('cameraSmoothing').title, /Stable/);
+    assert.match(smoothing.attributes['aria-label'], /Stable/);
+    smoothing.value = '0.9'; smoothing.oninput(); smoothing.onchange(); smoothing.onblur();
+    smoothing.onkeydown({ key: 'Enter', preventDefault() {} });
+    assert.deepEqual(calls, []);
+    assert.equal(smoothing.value, '0.5');
+    mode.value = 'lookahead'; mode.onchange();
+    assert.equal(input('cameraMode'), mode, 'mode change must not rebuild focused controls');
+    assert.equal(input('cameraSmoothing'), smoothing);
+    assert.equal(smoothing.disabled, false);
+    smoothing.value = '0.8'; smoothing.oninput(); smoothing.onchange();
+    mode.value = 'stable'; mode.onchange();
+    assert.equal(values.get('cameraSmoothing'), 0.8);
+    assert.equal(smoothing.disabled, true);
+    mode.value = 'lookahead'; mode.onchange();
+    assert.equal(smoothing.disabled, false);
+    assert.equal(smoothing.value, '0.8');
+});
+
+test('external mode changes refresh on interaction and discard a now-disabled preview', () => {
+    const { panel, calls, input, values } = makePopover({ mode: 'lookahead' });
+    const smoothing = input('cameraSmoothing');
+    smoothing.value = '0.9'; smoothing.oninput();
+    values.set('cameraMode', 'stable');
+    smoothing.onchange();
+    assert.deepEqual(calls, []);
+    assert.equal(smoothing.value, '0.5');
+    assert.equal(smoothing.disabled, true);
+    values.set('cameraMode', 'lookahead'); panel.vizPopover.onpointerover();
+    assert.equal(smoothing.disabled, false);
+    values.set('cameraMode', 'stable'); panel.vizPopover.onfocusin();
+    assert.equal(smoothing.disabled, true);
+});
+
+test('reopening reflects external settings and old popover controls cannot write', () => {
+    const { calls, input, values, rebuild } = makePopover();
+    const old = input(cameraStartControl.key);
+    old.value = '600'; old.oninput();
+    values.set(cameraStartControl.key, 450); values.set('cameraMode', 'lookahead'); rebuild();
+    assert.equal(input(cameraStartControl.key).value, '450');
+    assert.equal(input('cameraSmoothing').disabled, false);
+    old.onblur(); old.onchange();
+    assert.deepEqual(calls, []);
+});
+
+test('removed, reordered and replaced panes or renderers reject stale commits', () => {
+    const mutations = [
+        ctx => ctx.mod._setPanelsForTest([ctx.other]),
+        ctx => ctx.mod._setPanelsForTest([ctx.panel, ctx.other]),
+        ctx => { ctx.panel.hw = {}; },
+        ctx => { ctx.panel.vizMode = 'other'; },
+        ctx => { ctx.panel.vizPopover = makeElement(); },
+        ctx => installPanelFactory({ panelControls: interactionControls }),
+        ctx => { ctx.factory.panelControls = [...interactionControls]; },
+    ];
+    for (const mutate of mutations) {
+        const ctx = makePopover(), slider = ctx.input(cameraStartControl.key);
+        slider.value = '600'; slider.oninput(); mutate(ctx); slider.onblur(); slider.onchange();
+        assert.deepEqual(ctx.calls, []);
+    }
+});
+
+test('failed commits restore the actual setting and leave a subsequent retry possible', () => {
+    const { calls, input, row, factory, values } = makePopover({ rejectWrites: true });
+    const slider = input(cameraStartControl.key);
+    slider.value = '600'; slider.oninput(); slider.onchange();
+    assert.equal(slider.value, '700');
+    assert.match(row(cameraStartControl.key).title, /Could not apply/);
+    slider.onblur(); assert.equal(calls.length, 1);
+    factory.setPanelSetting = (index, key, value) => { calls.push([index, key, value]); values.set(key, value); return true; };
+    slider.value = '600'; slider.oninput(); slider.onchange();
+    assert.equal(slider.value, '600');
+    assert.deepEqual(calls, [[1, cameraStartControl.key, 600], [1, cameraStartControl.key, 600]]);
 });
 
 test('panelToPrefs encodes a plain arrangement panel', () => {
