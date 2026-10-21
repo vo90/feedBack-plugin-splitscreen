@@ -587,10 +587,10 @@ try {
 
     // Per-panel viz controls surfaced in a panel's "3D ⚙" popover. Each entry:
     //   { key, label, type:'toggle'|'range'|'select', default, min?, max?, step?, options? }
-    // `key` is the localStorage suffix the viz plugin reads per-panel. For
-    // highway_3d that's h3d_bg_panel<N>_<key>, falling back to the global
-    // h3d_bg_<key> (see the plugin's _bgReadSetting). A viz plugin can override
-    // this list at runtime by exposing `window.slopsmithViz_highway_3d.panelControls`
+    // `key` identifies the setting in the viz plugin's scoped settings bridge.
+    // Legacy highway_3d uses h3d_bg_panel<N>_<key> localStorage entries, falling
+    // back to h3d_bg_<key>. A viz plugin can override this list at runtime by
+    // exposing `window.feedBackViz_highway_3d.panelControls`
     // (same shape) — that takes precedence so the plugin owns the up-to-date
     // list without splitscreen needing edits when it adds options.
     // For `range`: min/max default to 0..1 and step to 0.05 when omitted.
@@ -611,12 +611,12 @@ try {
         };
     }
     function getPanelControlsFor(pluginId) {
-        // v1: only highway_3d is wired — _vizPanelGet/_vizPanelSet use its
-        // localStorage scheme (h3d_bg_panel<N>_<key>) and its window.h3dBgSet*
-        // setters. The popover stays hidden for other viz plugins until the
-        // descriptor carries per-plugin storage/setter info (or read/write fns).
+        // v1: only highway_3d is wired — _vizPanelGet/_vizPanelSet prefer its
+        // scoped factory bridge, with a storage-only fallback for older hosts.
+        // The popover stays hidden for other viz plugins until they provide a
+        // compatible settings contract.
         // A plugin can still customize *which* controls show via
-        // window.slopsmithViz_highway_3d.panelControls.
+        // window.feedBackViz_highway_3d.panelControls (legacy alias supported).
         if (pluginId !== 'highway_3d') return null;
         const fac = vizFactory(pluginId);
         // An array (even empty) is an intentional override — empty = opt out of
@@ -1397,13 +1397,22 @@ try {
     }
 
     // ── Per-panel viz controls ("3D ⚙" popover) ──
-    // Per-panel values live in the viz plugin's own per-panel localStorage keys
-    // (highway_3d: h3d_bg_panel<N>_<key>, fallback global h3d_bg_<key>) — NOT in
-    // splitscreenPanelPrefs. Writing the per-panel key is enough for the 3D
-    // renderer (it re-reads all settings each frame); for instant-rebuild
-    // settings (palette) we also re-fire the plugin's global setter with its
-    // existing value so _bgEmitChange runs. No global state changes hands.
+    // Let the renderer own inheritance, validation, in-memory fallbacks, and
+    // change notifications. Never use a global setter to refresh a panel: its
+    // effective inherited value may differ from the descriptor's default.
+    function _validVizPanelControl(pluginId, panelIdx, ctl) {
+        if (!Number.isSafeInteger(panelIdx) || panelIdx < 0 || !ctl || typeof ctl.key !== 'string') return false;
+        const controls = getPanelControlsFor(pluginId);
+        return !!controls && controls.some(candidate => candidate.key === ctl.key);
+    }
     function _vizPanelGet(pluginId, panelIdx, ctl) {
+        if (!_validVizPanelControl(pluginId, panelIdx, ctl)) return undefined;
+        const factory = vizFactory(pluginId);
+        if (factory && typeof factory.getPanelSetting === 'function') {
+            try { return factory.getPanelSetting(panelIdx, ctl.key); } catch (_) { return undefined; }
+        }
+        // Older hosts have no scoped bridge. Preserve their storage convention
+        // without guessing renderer-specific migration or inheritance rules.
         let v = null;
         try {
             v = localStorage.getItem('h3d_bg_panel' + panelIdx + '_' + ctl.key);
@@ -1420,32 +1429,17 @@ try {
         return v;
     }
     function _vizPanelSet(pluginId, panelIdx, ctl, value) {
-        try { localStorage.setItem('h3d_bg_panel' + panelIdx + '_' + ctl.key, String(value)); } catch (_) {}
-        // Re-fire the plugin's global setter with the global's *current* value
-        // (or the descriptor default if the global was never set) — the global
-        // is unchanged, but this triggers the plugin's change event so each
-        // renderer reloads and re-reads its per-panel key. Required for
-        // rebuild-type settings (palette retints materials only on this event);
-        // for the rest the 3D renderer's per-frame settings re-read would
-        // suffice, but firing is harmless. Pass the value in the descriptor's
-        // declared type — some 3D checkbox setters do `!!v`, so a non-empty
-        // string like 'false' would wrongly coerce to true. Skip only if the
-        // plugin isn't loaded / has no matching setter.
-        const cap = ctl.key.charAt(0).toUpperCase() + ctl.key.slice(1);
-        const setter = window['h3dBgSet' + cap];
-        if (typeof setter !== 'function') return;
-        let raw = null;
-        try { raw = localStorage.getItem('h3d_bg_' + ctl.key); } catch (_) {}
-        let v;
-        if (ctl.type === 'toggle') {
-            v = (raw == null) ? !!ctl.default : (raw === 'true' || raw === '1');
-        } else if (ctl.type === 'range') {
-            v = (raw == null) ? Number(ctl.default) : parseFloat(raw);
-            if (!Number.isFinite(v)) v = Number(ctl.default);
-        } else {
-            v = (raw == null) ? String(ctl.default) : raw;
+        if (!_validVizPanelControl(pluginId, panelIdx, ctl)) return false;
+        const factory = vizFactory(pluginId);
+        if (factory && typeof factory.setPanelSetting === 'function') {
+            try { return factory.setPanelSetting(panelIdx, ctl.key, value) === true; } catch (_) { return false; }
         }
-        try { setter(v); } catch (_) {}
+        // Legacy hosts pick up this scoped value at their next settings reload.
+        // They expose no scoped refresh API; calling a global setter here can
+        // overwrite the inherited setting for the main highway and other panes.
+        try { localStorage.setItem('h3d_bg_panel' + panelIdx + '_' + ctl.key, String(value)); }
+        catch (_) { return false; }
+        return true;
     }
 
     function buildVizPopover(panel, pluginId) {
@@ -4816,7 +4810,7 @@ try {
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = {
             getWsUrl, resolveArrIndex, getDefaultArrangements,
-            panelToPrefs, migratePanelPrefs, _ctlRange,
+            panelToPrefs, migratePanelPrefs, _ctlRange, _vizPanelGet, _vizPanelSet,
             getSyncUrl, generateRoomKey, normalizeRoomKey, ensureRoomKey,
             buildShareUrl, makeRemoteFollowerCfg, ROOM_KEY_ALPHABET,
             _setArrangementsForTest(next) { arrangements = next; },
